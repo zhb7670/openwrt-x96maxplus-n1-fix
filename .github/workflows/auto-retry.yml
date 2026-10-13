@@ -1,0 +1,67 @@
+# =============================================================================
+#  编译自愈守护 —— 主编译失败时自动重跑（最多 3 次）
+#
+#  作用：OpenWrt 编译里有大量非确定性失败（网络抖动、feed 波动、
+#        kconfig 时序、并发偶发），一次失败不代表编不出来。
+#        本 workflow 在 build.yml 失败时自动重跑，并保留上次的
+#        ccache / dl 缓存，第二次起速度显著加快。
+#
+#  手动跳过：把主workflow 改成成功时本 workflow 不会触发。
+# =============================================================================
+name: Auto-retry build
+
+on:
+  workflow_run:
+    workflows: ["Build OpenWrt for N1 & X96Max+ (v11)"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  retry:
+    name: 判断是否需要重跑
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 评估
+        id: evaluate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          # 只有失败才重跑
+          if [ "${{ github.event.workflow_run.conclusion }}" != "failure" ]; then
+            echo "::notice::上次编译结论为 ${{ github.event.workflow_run.conclusion }}，不重跑"
+            echo "RETRY_DECISION=skip"
+            exit 0
+          fi
+
+          # 从 run 标题里读尝试次数：v11(try1) / v11(try2) ...
+          ATTEMPT="${{ github.event.workflow_run.run_attempt }}"
+          MAX=4
+          echo "上次尝试次数: $ATTEMPT / 上限 $MAX"
+
+          if [ "$ATTEMPT" -ge "$MAX" ]; then
+            echo "::error::已重试 $ATTEMPT 次仍失败，停止自动重试，需人工介入"
+            echo "RETRY_DECISION=stop"
+            exit 0
+          fi
+
+          echo "RETRY_DECISION=retry"
+          echo "::notice::第 $ATTEMPT 次失败，自动触发第 $((ATTEMPT+1)) 次"
+
+      - name: 触发重跑
+        if: steps.evaluate.outputs.DECISION == 'retry'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          gh workflow run build.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f kernel_version="6.1.y" \
+            -f openwrt_ver="R24.1.13" \
+            -f lede_commit=""
+          echo "::notice::已触发第 $((ATTEMPT+1)) 次编译"
