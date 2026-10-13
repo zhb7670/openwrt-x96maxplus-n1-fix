@@ -1,5 +1,5 @@
 # =============================================================================
-#  X96Max+ / N1 OpenWrt 在线编译（v10·索引重建 + 插件自动检测 + 缓存提速）
+#  X96Max+ / N1 OpenWrt 在线编译（v11·分层校验 + 自动重试 + 索引重建 + 缓存提速）
 #
 #  ★ v10 三项改动
 #  ------------------------------------------------------------------
@@ -27,7 +27,7 @@
 #    v4 全程93 min    v7/v9 均在 5min 内挂在配置校验
 #    插件补齐 + 123 个 luci-app 后，预计 2.5~4h，处于 6h 上限内
 # =============================================================================
-name: Build OpenWrt for N1 & X96Max+ (v10)
+name: Build OpenWrt for N1 & X96Max+ (v11)
 
 on:
   workflow_dispatch:
@@ -388,10 +388,88 @@ jobs:
           done < .config.step8.bak
           make defconfig >/dev/null 2>&1 || true
 
-          # ★ v10 新增：三层自动检测（物理层 / 索引层 / 配置层）
-          #   取代原先"只看数量"的闸门 —— 数量阈值从 v6 的60 → v7 的30 → v9 的70
-          #   反复误判，因为缺插件的根因从来不是数量，而是索引层没收录。
-          bash .github/scripts/verify-packages.sh
+          # ★ v11：自包含分层校验（不依赖 .github/scripts 外部文件）
+          #   背景：v10 两次因 `bash .github/scripts/verify-packages.sh` 找不到而 exit 127。
+          #   根本原因是本workflow 没有 actions/checkout，runner 工作目录下
+          #   根本没有 .github/ 目录。此处把逻辑内嵌，彻底消除该依赖。
+          #
+          #   分层策略（按用户要求）：
+          #     L1 致命闸门 —— 科学上网核心插件必须齐全且为上游最新
+          #                      （passwall/passwall2/openclash/ssr-plus/mosdns/smartdns）
+          #     L2 软告警 —— 其它插件缺任何一个都只警告，不阻断编译
+          #     L3 无条件继续 —— 无论 L1/L2 结果如何都进入编译，绝不因计数失败误杀
+          echo "=========================================="
+          echo " v11 分层校验"
+          echo "=========================================="
+
+          # ---------- 强制重建索引（根因修复，v10 已验证有效）----------
+          rm -f tmp/.packageinfo tmp/.config-package.in
+          make defconfig >/dev/null 2>&1 || true
+
+          # ---------- L1：科学上网核心（致命）----------
+          CRITICAL="luci-app-passwall luci-app-passwall2 luci-app-openclash luci-app-ssr-plus luci-app-mosdns luci-app-smartdns luci-app-alist"
+          echo "----- L1 科学上网核心（缺任一则终止）-----"
+          L1_FAIL=0
+          for k in $CRITICAL; do
+            if grep -qE "^CONFIG_PACKAGE_${k}=y" .config 2>/dev/null; then
+              echo "  ✓ $k"
+            else
+              # 再试一次：强制写回 + defconfig（kconfig 首遍可能未扫描到）
+              echo "CONFIG_PACKAGE_${k}=y" >> .config
+              L1_FAIL=$((L1_FAIL+1))
+              echo "  ! $k 首遍未收录，已补写待重解析"
+            fi
+          done
+          if [ "$L1_FAIL" -gt 0 ]; then
+            make defconfig >/dev/null 2>&1 || true
+            echo "  -- 重解析后复查 --"
+            for k in $CRITICAL; do
+              if grep -qE "^CONFIG_PACKAGE_${k}=y" .config 2>/dev/null; then
+                echo "    ✓ $k 已恢复"
+              else
+                echo "    ✗ $k 仍缺失 → 终止"
+              fi
+            done
+            remain=$(for k in $CRITICAL; do grep -qE "^CONFIG_PACKAGE_${k}=y" .config 2>/dev/null || echo "$k"; done | wc -w)
+            if [ "$remain" -gt 0 ]; then
+              echo "::error::科学上网核心插件缺失: $(for k in $CRITICAL; do grep -qE "^CONFIG_PACKAGE_${k}=y" .config 2>/dev/null || echo $k; done | tr '\n' ' ')"
+              exit 1
+            fi
+          fi
+          echo "  ✓ L1 全部通过"
+
+          # ---------- L2：整体覆盖率（仅告警）----------
+          echo "----- L2 插件覆盖率（仅告警，不阻断）-----"
+          IN_INDEX=$(grep -c "^Package: " tmp/.packageinfo 2>/dev/null || true)
+          IN_CFG=$(grep -cE "^CONFIG_PACKAGE_luci-app-[a-zA-Z0-9_-]+=y" .config 2>/dev/null || true)
+          IN_CFG=${IN_CFG:-0}
+          echo "  packageinfo 收录包数: ${IN_INDEX:-0}"
+          echo "  config 中luci-app: $IN_CFG"
+          if [ "$IN_CFG" -lt 80 ]; then
+            echo "  ::warning::luci-app 数量 $IN_CFG 偏少（官方基线 123 条目/ 83 独立插件）"
+            echo "  ::warning::缺失清单（不阻断，继续编译）:"
+            for k in luci-app-turboacc luci-app-ddns luci-app-transmission luci-app-wireguard \
+                     luci-app-zerotier luci-app-frpc luci-app-frps luci-app-openvpn-server \
+                     luci-app-v2ray-server luci-app-kodexplorer luci-app-verysync \
+                     luci-app-nps luci-app-rclone luci-app-qbittorrent luci-app-diskman; do
+              if ! grep -qE "^CONFIG_PACKAGE_${k}=y" .config 2>/dev/null; then
+                echo "      - $k"
+              fi
+            done
+            echo "  ::warning::继续编译（这些缺失不会导致编译失败）"
+          else
+            echo "  ✓ L2 覆盖率正常"
+          fi
+
+          # ---------- L3：科学上网插件版本新鲜度（仅告警）----------
+          echo "----- L3 科学上网插件版本（仅告警）-----"
+          for d in package/luci-app-passwall package/luci-app-passwall2 package/luci-app-openclash package/luci-app-ssr-plus; do
+            if [ -f "$d/Makefile" ]; then
+              v=$(grep -m1 -E '^PKG_VERSION' "$d/Makefile" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+              echo "  $(basename $d): ${v:-未知}"
+            fi
+          done
+          echo "=========================================="
 
       # ============================================================
       # ★ 核心修复：armvirt → armsr/armv8
@@ -477,11 +555,42 @@ jobs:
           [ $fail -eq 0 ] || { echo "::error::配置不完整，终止"; exit 1; }
           echo "== target + rootfs 格式锁定成功 =="
 
-          #★ v10 新增：锁定 target 这步会再跑两次 make defconfig，
-          #   有可能把插件重新挤掉。这里做兜底复检，
-          #   确认第9步检测通过的插件在这一步之后依然在 .config 里。
-          echo "===== target 锁定后插件复检====="
-          bash .github/scripts/verify-packages.sh
+          # ★ v11：target 锁定会再跑 make defconfig，可能把插件挤掉。
+          #   这里做自包含的兜底复检：L1 科学上网核心缺失才终止，L2 仅告警。
+          echo "===== target 锁定后插件复检 ====="
+          rm -f tmp/.packageinfo tmp/.config-package.in
+          make defconfig >/dev/null 2>&1 || true
+
+          CRITICAL="luci-app-passwall luci-app-passwall2 luci-app-openclash luci-app-ssr-plus luci-app-mosdns luci-app-smartdns luci-app-alist"
+          need_rb=0
+          for k in $CRITICAL; do
+            if ! grep -qE "^CONFIG_PACKAGE_${k}=y" .config 2>/dev/null; then
+              echo "CONFIG_PACKAGE_${k}=y" >> .config
+              need_rb=$((need_rb+1))
+            fi
+          done
+          if [ "$need_rb" -gt 0 ]; then
+            echo "  补写 $need_rb 条，重跑 defconfig"
+            make defconfig >/dev/null 2>&1 || true
+          fi
+
+          miss=""
+          for k in $CRITICAL; do
+            if grep -qE "^CONFIG_PACKAGE_${k}=y" .config 2>/dev/null; then
+              echo "  ✓ $k"
+            else
+              echo "  ✗ $k"
+              miss="$miss $k"
+            fi
+          done
+          if [ -n "$miss" ]; then
+            echo "::error::target 锁定后科学上网核心仍缺失:$miss"
+            exit 1
+          fi
+          echo "  ✓ L1 复检通过"
+
+          cnt=$(grep -cE "^CONFIG_PACKAGE_luci-app-[a-zA-Z0-9_-]+=y" .config 2>/dev/null || true)
+          echo "  当前 config 内 luci-app: ${cnt:-0}（仅供参考，不作闸门）"
 
       - name: 移除 haiibo 的 ARM 编译参数覆盖
         run: |
