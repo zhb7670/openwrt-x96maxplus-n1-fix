@@ -1,5 +1,5 @@
 # =============================================================================
-#  X96Max+ / N1 OpenWrt 在线编译（v5·修正产物路径）
+#  X96Max+ / N1 OpenWrt 在线编译（v6·修复插件丢失）
 #
 #  ★ 本版核心修复：armvirt → armsr/armv8
 #  ------------------------------------------------------------------
@@ -19,7 +19,7 @@
 #  另：校验阶段会检测 bin/targets/x86 目录，一旦出现立即判失败，
 #      避免“编译成功但架构错误”再次发生。
 # =============================================================================
-name: Build OpenWrt for N1 & X96Max+ (v5)
+name: Build OpenWrt for N1 & X96Max+ (v6)
 
 on:
   workflow_dispatch:
@@ -148,6 +148,82 @@ jobs:
           ./diy-script.sh
           ./scripts/preset-clash-core.sh arm64 || echo "::warning::clash 核心下载失败"
           ./scripts/preset-terminal-tools.sh || echo "::warning::终端工具下载失败"
+
+      # ============================================================
+      # ★★ v5 关键修复：拍平嵌套插件目录 + 完整性校验
+      #   v4 实测：编译阶段 package/ 下只编了 package/base-files 一个包，
+      #   60+ 个第三方插件（passwall/passwall2/openclash/mosdns/smartdns/alist…）
+      #   **一个都没被编译**，rootfs 只有 148MB（官方那份 394MB/1317 包）。
+      #   原因：diy-script.sh 用 `git clone <repo> package/luci-app-passwall`，
+      #   而 Openwrt-Passwall/openwrt-passwall 仓库顶层又是一层luci-app-passwall/，
+      #   于是路径变成 package/luci-app-passwall/luci-app-passwall/Makefile，
+      #   多一层 → OpenWrt 扫描 package/ 时完全看不到该包 → 静默跳过。
+      # ============================================================
+      - name: 拍平插件目录并校验完整性
+        run: |
+          cd openwrt
+          echo "===== 拍平前 package/ 下的插件（含嵌套检测）====="
+          for d in package/*/; do
+            n=$(basename "$d")
+            if [ -f "package/$n/Makefile" ]; then
+              echo "  正常   $n"
+            else
+              inner=$(find "package/$n" -maxdepth 2 -name Makefile -type f 2>/dev/null | head -n1)
+              if [ -n "$inner" ]; then
+                echo "  嵌套!  $n  ->  内层 $(dirname "$inner")"
+              fi
+            fi
+          done
+
+          echo "===== 执行拍平 ====="
+          for d in package/*/; do
+            n=$(basename "$d")
+            [ "$n" = "feeds" ] && continue
+            [ -f "package/$n/Makefile" ] && continue          # 已正常
+            inner=$(find "package/$n" -maxdepth 2 -name Makefile -type f 2>/dev/null | head -n1)
+            [ -z "$inner" ] && continue
+            idir=$(dirname "$inner")
+            imname=$(basename "$idir")
+            echo "  处理 $n (内层包名: $imname)"
+            if [ "$imname" = "$n" ]; then
+              #名字相同：把内层内容提到外层，删掉多余壳
+              tmpd="package/.flat_$n"
+              mv "$idir" "$tmpd" && rm -rf "$d" && mv "$tmpd" "package/$n"
+              echo "    已拍平 -> package/$n"
+            else
+              # 名字不同：整目录改名
+              mv "$d" "package/$imname" 2>/dev/null && echo "    已改名 -> package/$imname" \
+                || echo "    ::warning::改名失败 $n -> $imname"
+            fi
+          done
+
+          echo "===== 拍平后：有 Makefile 的包 ====="
+          cnt=0
+          for d in package/*/; do
+            n=$(basename "$d")
+            if [ -f "package/$n/Makefile" ]; then cnt=$((cnt+1)); echo "  OK   $n"; fi
+          done
+          echo "  可识别的 package/ 包总数: $cnt"
+          [ "$cnt" -ge 10 ] || { echo "::error::可识别包过少（$cnt），插件可能未正确落地"; exit 1; }
+
+      - name: 重建配置（拍平后重新解析插件依赖）
+        run: |
+          cd openwrt
+          echo "===== defconfig（让拍平后的包参与依赖解析）====="
+          make defconfig
+
+          echo "===== 完整性校验：config 中 luci-app 数量 ====="
+          n=$(grep -cE "^CONFIG_PACKAGE_luci-app-[a-zA-Z0-9_-]+=y" .config || true)
+          echo "  config 内 luci-app 条目: $n"
+          echo "  官方 haiibo rootfs 实测:83 个 luci-app（另含 40 个 i18n语言包）"
+          if [ "$n" -lt 60 ]; then
+            echo "::error::luci-app 数量异常偏少（$n < 60），说明大量插件未被识别"
+            echo "::error::以下 config 中的 luci-app 未被识别（附当前 package/ 下可用包）"
+            echo "--- package/ 下实际可用 ---"
+            ls -d package/luci-app-* 2>/dev/null | head -30
+            exit 1
+          fi
+          echo "  ✓ 插件集完整"
 
       # ============================================================
       # ★ 核心修复：armvirt → armsr/armv8
@@ -322,6 +398,21 @@ jobs:
             exit 1
           fi
           echo "== 编译完成 =="
+
+          #★ 硬校验：确认第三方插件真的被编译了。
+          #   v4 的教训：make 全程 success，但 60+ 插件一个没编，rootfs 只有 148MB。
+          echo "===== 校验第三方插件是否真的被编译 ====="
+          ifgrep=$(grep -cE "\-C package/luci-app-passwall|\-C package/luci-app-openclash" /tmp/build.log || true)
+          pkgipk=$(find bin -name 'luci-app-*.ipk' 2>/dev/null | wc -l)
+          echo "  build.log 中 package/luci-app-* 编译记录: $ifgrep"
+          echo "  产出的 luci-app-*.ipk 数: $pkgipk"
+          if [ "$pkgipk" -lt 10 ]; then
+            echo "::error::luci-app ipk 产出过少（$pkgipk < 10），插件多半未进入编译"
+            echo "::error::bin 下 luci-app ipk 列表："
+            find bin -name 'luci-app-*.ipk' 2>/dev/null | head -20
+            exit 1
+          fi
+          echo "  ✓ 插件已参与编译"
 
       # ============================================================
       # ★ 架构硬校验 + targz rootfs 生成（v4 关键修复）
