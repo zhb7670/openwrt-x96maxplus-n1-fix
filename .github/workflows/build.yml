@@ -48,11 +48,6 @@ on:
 permissions:
   contents: write
 
-# ★ 6 小时硬约束保护：留 20 min 余量（340 min）。
-#   公开仓库单job 上限 6h，超时会被判失败且拿不到任何产物。
-#   设340 是为了留出上传产物的时间。
-timeout-minutes: 340
-
 concurrency:
   group: build-openwrt-${{ github.ref }}
   cancel-in-progress: false
@@ -68,6 +63,11 @@ jobs:
   build-rootfs:
     name: 1. 编译 armsr/armv8 rootfs
     runs-on: ubuntu-22.04
+    # ★ 6 小时硬约束保护：设340 min 留 20 min 余量。
+    #   timeout-minutes 必须挂在 job 上（挂工作流顶层会解析失败）。
+    #   公开仓库单 job 上限 6h，超时判失败且拿不到任何产物；
+    #   留出的 20 min 用于上传产物与日志。
+    timeout-minutes: 340
     steps:
       - name: 检查磁盘与内存
         run: |
