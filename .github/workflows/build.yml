@@ -1,25 +1,33 @@
 # =============================================================================
-#  X96Max+ / N1 OpenWrt 在线编译（v9·补齐插件集）
+#  X96Max+ / N1 OpenWrt 在线编译（v10·索引重建 + 插件自动检测 + 缓存提速）
 #
-#  ★ 本版核心修复：armvirt → armsr/armv8
+#  ★ v10 三项改动
 #  ------------------------------------------------------------------
-#  【v2 失败的真正原因】
-#    LEDE 仓库在 2025-04-28 提交 dc780ad837 "armsr: add new target from armvirt"
-#    把 target/linux/armvirt 更名/重构为 target/linux/armsr（细分 armv7 / armv8）。
-#    所以在当前 master(ff7be3fa21) 里 target/linux/armvirt 目录已不存在。
-#    v2 沿用 haiibo 那份只写了 CONFIG_TARGET_armvirt* 的旧 config，
-#    make defconfig 找不到对应 target -> 回落到默认的 x86/64
-#    -> 编译“成功”但产物是 bin/targets/x86/64（纯 x86，根本不是 ARM 固件）。
+#  1) 强制重建 tmp/.packageinfo（少插件的真正根因）
+#     该文件是 mtime 增量缓存。本job 里 update feeds 先触发了 metadata 扫描，
+#     之后才 clone package/ 下的插件 → 新目录从未进索引 → Kconfig 不认识这些符号
+#     → make defconfig 把它们当未知行静默丢弃（连 "is not set" 都不产生）。
+#     v9 实测证据：全日志 "Collecting package info: package/" 命中数 = 0，
+#     而 .config 里存活的 ssr-plus/turboacc/ddns 全部来自 feeds/。
 #
-#  【正确做法】
-#    target = armsr，subtarget = armv8，device = generic
-#    产物路径 = bin/targets/armsr/armv8/*rootfs.tar.gz
-#    对应关系：armvirt/64  ==  armsr/armv8   （同一套东西，改了名）
+#  2) 多级嵌套包拍平
+#     sbwml/luci-app-alist 真实结构是 package/luci-app-alist/alist/luci-app-alist/
+#     （两层壳）。OpenWrt 只扫 package/*/Makefile 一层，v6~v9 的同名前缀拍平
+#     对它无效 → alist 从未进Kconfig。现改为 find -maxdepth 3 递归兜底。
 #
-#  另：校验阶段会检测 bin/targets/x86 目录，一旦出现立即判失败，
-#      避免“编译成功但架构错误”再次发生。
+#  3) 编译提速（保证 6 小时内跑完）
+#     - actions/checkout 不再删历史（--depth=1 会让 git 操作更慢）
+#     - ccache：官方 haiibo 用 ccache: false，但首次编译无缓存时差别不大；
+#       这里启用 ccache 并做跨 run 缓存，第二次起可省30~50% 编译时间
+#     - dl/ 源码包缓存：避免每次重新下载（官方 make download 是独立步骤）
+#     - timeout-minutes: 340留出余量，避免撞 GitHub 6 小时硬上限被判定失败
+#
+#  【历史耗时参考】
+#    v3 编译步实测 2h22m（但那次 config 缺 rootfs 格式、插件不全）
+#    v4 全程93 min    v7/v9 均在 5min 内挂在配置校验
+#    插件补齐 + 123 个 luci-app 后，预计 2.5~4h，处于 6h 上限内
 # =============================================================================
-name: Build OpenWrt for N1 & X96Max+ (v9)
+name: Build OpenWrt for N1 & X96Max+ (v10)
 
 on:
   workflow_dispatch:
@@ -39,6 +47,11 @@ on:
 
 permissions:
   contents: write
+
+# ★ 6 小时硬约束保护：留 20 min 余量（340 min）。
+#   公开仓库单job 上限 6h，超时会被判失败且拿不到任何产物。
+#   设340 是为了留出上传产物的时间。
+timeout-minutes: 340
 
 concurrency:
   group: build-openwrt-${{ github.ref }}
@@ -75,6 +88,40 @@ jobs:
             msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools \
             libpython3-dev qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs \
             upx-ucl unzip vim wget xmlto xxd zlib1g-dev time
+
+      # ★ v10 提速：ccache 跨 run 缓存
+      #   首次编译无缓存，作用有限；但只要同一 repo 第二次触发
+      #   （改配置重试、修 bug 重跑），就能省下 30~50% 的编译时间。
+      #   6 小时上限下，这是最有效的保险。
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.repository }}-${{ inputs.kernel_version }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ github.repository }}-${{ inputs.kernel_version }}-
+            ccache-${{ github.repository }}-
+
+      - name: 配置 ccache
+        run: |
+          # 官方 haiibo 用 ccache: false；这里开启并调大缓存，
+          # 因为我们要留余量给 6h 上限。
+          ccache -M 20G
+          ccache -z
+          echo "ccache 统计(编译后):"
+          ccache -s
+
+      # ★ v10 提速：源码包（dl/）跨 run 缓存
+      #   OpenWrt 的 make download 要下几百 MB 源码包，
+      #   失败重试时重复下载很浪费时间。
+      - name: 恢复 dl 源码包缓存
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: dl-${{ github.repository }}-${{ inputs.kernel_version }}-${{ github.run_id }}
+          restore-keys: |
+            dl-${{ github.repository }}-${{ inputs.kernel_version }}-
+            dl-${{ github.repository }}-
 
       - name: 拉取 LEDE 源码
         run: |
@@ -207,6 +254,36 @@ jobs:
             done
           fi
 
+          # ★ v10 新增：处理【多级嵌套】包
+          #   实测 sbwml/luci-app-alist 的真实结构是：
+          #     package/luci-app-alist/alist/luci-app-alist/Makefile   ← 两层！
+          #   上面的同名前缀拍平只处理 package/<n>/<n>/Makefile 一层，
+          #   对 alist 这种「壳/子目录/包」三层结构无效，
+          #   结果 alist 一直没进 Kconfig（v9 实测 Collecting 命中 0）。
+          #   这里用 find递归兜底：任意深度找到 <包名>/Makefile 就提升到 package/ 顶层。
+          echo "===== 处理多级嵌套包（任意深度兜底）====="
+          for k in luci-app-alist luci-app-mosdns luci-app-passwall \
+                   luci-app-passwall2 luci-app-ssr-plus luci-app-openclash \
+                   luci-app-smartdns; do
+            [ -f "package/$k/Makefile" ] && continue          # 已在一层，无需处理
+            [ -d "package/$k" ] || continue# 未 clone
+            # 递归找名为 $k 且含 Makefile 的目录（深度 1~3）
+            inner_path=$(find "package/$k" -maxdepth 3 -type d -name "$k" 2>/dev/null \
+                         | while read -r d; do
+                             [ -f "$d/Makefile" ] && { echo "$d"; break; }
+                           done | head -1)
+            if [ -n "$inner_path" ]; then
+              echo "  多级嵌套: $inner_path"
+              mv "$inner_path" "package/.flat_$k" && rm -rf "package/$k" \
+                 && mv "package/.flat_$k" "package/$k"
+              if [ -f "package/$k/Makefile" ]; then
+                echo "    OK 已提升到 package/$k/Makefile"
+              else
+                echo "    ::error::提升失败 $k"
+              fi
+            fi
+          done
+
           echo "===== 处理 mosdns（仓库顶层即多包，需整体放入但保证可被扫到）====="
           # package/luci-app-mosdns 内是 geo2txt 等子包；
           # sbwml/luci-app-mosdns 顶层 = luci-app-mosdns/，同名前缀，已在上面拍平。
@@ -229,6 +306,34 @@ jobs:
               echo "   $n : $([ -f "package/$n/Makefile" ] && echo OK || echo '无 Makefile') | 内层: $(ls "$d" 2>/dev/null | head -3 | tr '\n' ' ')"
             done
             exit 1
+          fi
+
+          # ★ v10 修复：强制重建 packageinfo 索引
+          #   根因：tmp/.packageinfo 是 mtime 增量缓存。本job 里
+          #   update feeds 先触发了一次 metadata 扫描，之后才 clone
+          #   package/ 下的插件，这些新目录从未进入索引，Kconfig 不认识它们，
+          #   make defconfig 会把它们当未知符号静默丢弃（连 is not set 都不产生）。
+          #   实测证据：v9 全日志 "Collecting package info: package/" 命中数 = 0，
+          #   而 .config 里存活的 ssr-plus/turboacc/ddns 全部来自 feeds/。
+          echo "===== 强制重建 packageinfo 索引 ====="
+          rm -f tmp/.packageinfo tmp/.config-package.in
+          rm -rf tmp/info
+          make defconfig >/dev/null 2>&1 || true
+          echo "  索引重建后，package/ 收录情况："
+          idx_ok=0; idx_bad=0
+          for d in package/*/; do
+            n=$(basename "$d")
+            case " $OFFICIAL " in *" $n "*) continue ;; esac
+            [ -f "package/$n/Makefile" ] || continue
+            if grep -q "^Package: $n\$" tmp/.packageinfo 2>/dev/null; then
+              echo "    [索引OK] $n"; idx_ok=$((idx_ok+1))
+            else
+              echo "    [索引缺] $n   <<< Kconfig 仍不认识此包"; idx_bad=$((idx_bad+1))
+            fi
+          done
+          echo "  索引收录: $idx_ok 个OK / $idx_bad 个缺失"
+          if [ "$idx_bad" -gt 0 ]; then
+            echo "::error::仍有 $idx_bad 个包未被 packageinfo 收录，需检查这些包的 Makefile 是否可被 metadata 解析"
           fi
 
       - name: 重建配置并补齐插件（拍平后）
@@ -263,7 +368,12 @@ jobs:
           done < .config.step8.bak
           echo "  已写回$rewritten 条 CONFIG_PACKAGE"
 
-          echo "===== defconfig x2（第一遍让 kconfig 认识新包，第二遍稳定）====="
+          echo "===== defconfig x2 ====="
+          # ★ v10 修复：写回之前先清索引。这一步是本次修复的核心。
+          #   v9 实测：写回 762 条 CONFIG_PACKAGE 后 defconfig 又全部丢弃，
+          #   原因是 package/ 下的包从未进入 tmp/.packageinfo，
+          #   Kconfig 不认识这些符号 -> 写进去的行被当未知行静默丢掉。
+          rm -f tmp/.packageinfo tmp/.config-package.in
           make defconfig >/dev/null 2>&1 || true
           # 第二遍前再次回写（第一遍 defconfig 可能又清掉了没被解析的）
           while IFS= read -r line; do
@@ -278,37 +388,10 @@ jobs:
           done < .config.step8.bak
           make defconfig >/dev/null 2>&1 || true
 
-          echo "===== 完整性校验 ====="
-          n=$(grep -cE "^CONFIG_PACKAGE_luci-app-[a-zA-Z0-9_-]+=y" .config 2>/dev/null || true)
-          nu=$(grep -cE "^CONFIG_PACKAGE_luci-i18n-[a-zA-Z0-9_-]+=y" .config 2>/dev/null || true)
-          n=${n:-0}; nu=${nu:-0}
-          echo "  config 内 luci-app: $n"
-          echo "  config 内 luci-i18n: $nu"
-          echo "  官方 haiibo rootfs 实测: luci-app 83 / i18n 40"
-
-          echo "  ----- 关键插件逐项 -----"
-          missing=""
-          for k in luci-app-passwall luci-app-passwall2 luci-app-openclash \
-                   luci-app-mosdns luci-app-smartdns luci-app-alist luci-app-ssr-plus \
-                   luci-app-turboacc luci-app-ddns luci-app-transmission luci-app-wireguard \
-                   luci-app-zerotier luci-app-frpc luci-app-frps luci-app-openvpn-server \
-                   luci-app-v2ray-server luci-app-kodexplorer luci-app-verysync; do
-            if grep -qE "^CONFIG_PACKAGE_${k}=y" .config 2>/dev/null; then
-              echo "    ✓ $k"
-            else
-              echo "    ✗ $k 缺失"; missing="$missing $k"
-            fi
-          done
-
-          if [ "$n" -lt 70 ]; then
-            echo "::error::luci-app 数量仍偏少（$n < 70，官方 83）"
-            echo "::error::缺失清单:$missing"
-            echo "::error::----- package/ 与 feeds/ 下实际可用的 luci-app -----"
-            ls -d package/luci-app-*/ 2>/dev/null | sed 's|package/||;s|/$||' | head -40
-            ls -d feeds/luci/applications/luci-app-*/ 2>/dev/null | sed 's|.*/||;s|/$||' | head -60
-            exit 1
-          fi
-          echo "  ✓ 插件集完整（$n 个 luci-app）"
+          # ★ v10 新增：三层自动检测（物理层 / 索引层 / 配置层）
+          #   取代原先"只看数量"的闸门 —— 数量阈值从 v6 的60 → v7 的30 → v9 的70
+          #   反复误判，因为缺插件的根因从来不是数量，而是索引层没收录。
+          bash .github/scripts/verify-packages.sh
 
       # ============================================================
       # ★ 核心修复：armvirt → armsr/armv8
@@ -394,6 +477,12 @@ jobs:
           [ $fail -eq 0 ] || { echo "::error::配置不完整，终止"; exit 1; }
           echo "== target + rootfs 格式锁定成功 =="
 
+          #★ v10 新增：锁定 target 这步会再跑两次 make defconfig，
+          #   有可能把插件重新挤掉。这里做兜底复检，
+          #   确认第9步检测通过的插件在这一步之后依然在 .config 里。
+          echo "===== target 锁定后插件复检====="
+          bash .github/scripts/verify-packages.sh
+
       - name: 移除 haiibo 的 ARM 编译参数覆盖
         run: |
           cd openwrt
@@ -462,8 +551,30 @@ jobs:
           fi
 
       - name: 编译
+        env:
+          # ★ v10 提速：让 make 实际走ccache。
+          #   装了 ccache 包不等于会用，必须把 CCACHE 打开并写进 .config。
+          #   HOSTCC/SUPPORTED_CCACHE 让主机侧工具也走缓存。
+          USE_CCACHE: "1"
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          HOSTCC: "ccache gcc"
+          HOSTCXX: "ccache g++"
+          HOSTCCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
           cd openwrt
+          # 把 ccache 写进 .config，确保内核与包都启用
+          grep -q '^CONFIG_CCACHE=y' .config || echo "CONFIG_CCACHE=y" >> .config
+          grep -q '^CONFIG_CCACHE_HOSTCC=y' .config || echo "CONFIG_CCACHE_HOSTCC=y" >> .config
+          make defconfig >/dev/null 2>&1 || true
+          grep -E '^CONFIG_CCACHE' .config || true
+
+          export PATH="$CCACHE_DIR:$PATH"
+          export CCACHE_DISABLE=0
+          ccache -M 20G
+          ccache -z
+          ccache -s | head -8
+          echo "CPU 核数: $(nproc)"
+
           set -o pipefail
           make -j$(nproc) download 2>&1 | tee /tmp/download.log
           rc=${PIPESTATUS[0]}
@@ -473,7 +584,9 @@ jobs:
             rc2=${PIPESTATUS[0]}
             [ "$rc2" -ne 0 ] && { echo "::error::download 持续失败"; grep -naE "Failed to download|wget returned" /tmp/download2.log | tail -20 || true; exit 1; }
           fi
-          echo "== 开始编译（约 2~3 小时）=="
+          echo "== 开始编译（历史实测 2h22m，本次插件补齐后预计 2.5~4h，上限 340min）=="
+          # 记录编译起始时间，结束后算耗时，便于后续调优
+          T0=$(date +%s)
           # 用 PIPESTATUS 判定，不能用 `if ! cmd | tee`（bash 中 ! 作用于 tee 的退出码）
           make -j$(nproc) 2>&1 | tee /tmp/build.log
           rc=${PIPESTATUS[0]}
@@ -483,6 +596,16 @@ jobs:
             exit 1
           fi
           echo "== 编译完成 =="
+
+          # ★ v10 新增：耗时与缓存命中率统计（用于后续调优/ 判断是否超6h）
+          T1=$(date +%s)
+          echo "===== 编译耗时统计 ====="
+          echo "  编译阶段耗时: $(( (T1-T0)/60 )) 分钟 $(( (T1-T0)%60 )) 秒"
+          echo "  当前时间: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "----- ccache 命中率 -----"
+          ccache -s2>/dev/null | head -12 || true
+          echo "----- dl 缓存大小 -----"
+          du -sh dl 2>/dev/null || true
 
           # ★ 最终保险：编译前最后确认 config 里插件还在。
           #   defconfig 可能清掉未被 kconfig 识别的条目，
