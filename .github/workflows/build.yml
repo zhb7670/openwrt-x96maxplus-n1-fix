@@ -1,5 +1,5 @@
 # =============================================================================
-#  X96Max+ / N1 OpenWrt 在线编译（v3·修正架构）
+#  X96Max+ / N1 OpenWrt 在线编译（v4·修正 rootfs 产出）
 #
 #  ★ 本版核心修复：armvirt → armsr/armv8
 #  ------------------------------------------------------------------
@@ -19,7 +19,7 @@
 #  另：校验阶段会检测 bin/targets/x86 目录，一旦出现立即判失败，
 #      避免“编译成功但架构错误”再次发生。
 # =============================================================================
-name: Build OpenWrt for N1 & X96Max+ (v3)
+name: Build OpenWrt for N1 & X96Max+ (v4)
 
 on:
   workflow_dispatch:
@@ -174,6 +174,40 @@ jobs:
           done
           make defconfig
 
+          # ------------------------------------------------------------
+          # ★ 关键修复（v4）：haiibo 的 armv8-plus.config 把所有 rootfs
+          #   格式都禁用了：
+          #     # CONFIG_TARGET_ROOTFS_CPIOGZ is not set
+          #     # CONFIG_TARGET_ROOTFS_SQUASHFS is not set
+          #     # CONFIG_TARGET_IMAGES_GZIP is not set
+          #   而 armsr 的 FEATURES 明明写着 "cpiogz ext4 ramdisk squashfs targz"，
+          #   rootfs.tar.gz 正是由 targz 产出。全部禁用 => make 正常跑完、
+          #   target/install 也执行，但 bin/targets/armsr/armv8/ 下**一个文件都没有**。
+          #   这就是 v3 编了2.5 小时却在第13步"未找到 rootfs"的真正原因。
+          # ------------------------------------------------------------
+          echo "===== 启用 rootfs 输出格式 ====="
+          #★ 关键：真正控制 rootfs.tar.gz 的是 CONFIG_TARGET_ROOTFS_TARGZ
+          #（include/image.mk: `ifdef CONFIG_TARGET_ROOTFS_TARGZ / define Image/Build/targz`
+          #   且 kernel_prepare 阶段会直接 `$(call Image/Build/targz)`）。
+          #   v3 失败就是因为 haiibo config 里没有这一项。
+          for kv in \
+            "CONFIG_TARGET_ROOTFS_TARGZ=y" \
+            "CONFIG_TARGET_ROOTFS_CPIOGZ=y" \
+            "CONFIG_TARGET_ROOTFS_EXT4FS=y" \
+            "CONFIG_TARGET_ROOTFS_SQUASHFS=y" \
+            "CONFIG_TARGET_IMAGES_GZIP=y" \
+            ; do
+            k="${kv%%=*}"; v="${kv#*=}"
+            sed -i "/^${k}=/d;/^# ${k} is not set$/d" .config
+            echo "${k}=${v}" >> .config
+          done
+          make defconfig
+          echo "--- 生效确认（应全部 =y）---"
+          for k in CONFIG_TARGET_ROOTFS_TARGZ CONFIG_TARGET_ROOTFS_CPIOGZ \
+                   CONFIG_TARGET_ROOTFS_SQUASHFS CONFIG_TARGET_IMAGES_GZIP; do
+            grep -E "^${k}=" .config || echo "MISS $k"
+          done
+
           echo "===== target 校验 ====="
           fail=0
           for k in CONFIG_TARGET_armsr CONFIG_TARGET_armsr_armv8 \
@@ -186,14 +220,18 @@ jobs:
           done
           echo "----- ARCH -----"
           grep -E '^CONFIG_TARGET_(ARCH|ARCH_PACKAGES|ARCH_WORDSIZE)' .config || true
+          echo "----- ROOTFS 格式（关键，必须为 y 才有产出）-----"
+          for k in CONFIG_TARGET_ROOTFS_CPIOGZ CONFIG_TARGET_ROOTFS_SQUASHFS CONFIG_TARGET_IMAGES_GZIP; do
+            if grep -qE "^${k}=y" .config; then echo "OK   $k=y"; else echo "MISS $k"; fail=1; fi
+          done
           echo "----- 确认没有 x86 混入 -----"
           if grep -qE '^CONFIG_TARGET_(x86|PC|x86_64)' .config; then
             echo "::error::x86 target 混入！"; fail=1
           else
             echo "OK   无 x86"
           fi
-          [ $fail -eq 0 ] || { echo "::error::target 配置不完整，终止（否则会编出 x86 固件）"; exit 1; }
-          echo "== target 锁定成功 =="
+          [ $fail -eq 0 ] || { echo "::error::配置不完整，终止"; exit 1; }
+          echo "== target + rootfs 格式锁定成功 =="
 
       - name: 移除 haiibo 的 ARM 编译参数覆盖
         run: |
@@ -249,60 +287,133 @@ jobs:
           [ $miss -eq 0 ] && echo "必选包自检通过" || echo "::warning::有包缺失"
           echo "===== 再次确认 target 未被 defconfig 丢掉 ====="
           grep -E '^CONFIG_TARGET_(armsr|BOARD|SUBTARGET|ARCH)=' .config
+          # ★ 最后一道防线：确认 rootfs 输出格式仍在（defconfig 可能重置）
+          echo "===== 再次确认 rootfs 格式未被丢掉 ====="
+          rmiss=0
+          for k in CONFIG_TARGET_ROOTFS_TARGZ CONFIG_TARGET_IMAGES_GZIP; do
+            if grep -qE "^${k}=y" .config; then echo "OK   $k=y"; else echo "MISS $k（重新写入并 defconfig）"; rmiss=1; fi
+          done
+          if [ "$rmiss" -ne 0 ]; then
+            echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
+            echo "CONFIG_TARGET_IMAGES_GZIP=y" >> .config
+            make defconfig
+            echo "--- 补写后 ---"; grep -E '^CONFIG_TARGET_ROOTFS_TARGZ=|^CONFIG_TARGET_IMAGES_GZIP=' .config
+          fi
 
       - name: 编译
         run: |
           cd openwrt
-          make -j$(nproc) download || make -j$(nproc) download || true
-          echo "== 开始编译 =="
           set -o pipefail
-          if ! make -j$(nproc) 2>&1 | tee /tmp/build.log; then
-            echo "::error::编译失败，错误摘要："
-            grep -nE '(^|: )(error|Error|ERROR):|No such file|cannot |undefined reference|Build failed' /tmp/build.log | tail -40 || true
+          make -j$(nproc) download 2>&1 | tee /tmp/download.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::并行 download 有失败项，串行重试"
+            make download 2>&1 | tee /tmp/download2.log
+            rc2=${PIPESTATUS[0]}
+            [ "$rc2" -ne 0 ] && { echo "::error::download 持续失败"; grep -naE "Failed to download|wget returned" /tmp/download2.log | tail -20 || true; exit 1; }
+          fi
+          echo "== 开始编译（约 2~3 小时）=="
+          # 用 PIPESTATUS 判定，不能用 `if ! cmd | tee`（bash 中 ! 作用于 tee 的退出码）
+          make -j$(nproc) 2>&1 | tee /tmp/build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::编译失败（rc=$rc），错误摘要："
+            grep -naE '(^|: )(error|Error|ERROR):|No such file|cannot |undefined reference|Build failed' /tmp/build.log | tail -40 || true
             exit 1
           fi
           echo "== 编译完成 =="
 
       # ============================================================
-      # ★ 架构硬校验：x86 产物一旦出现立即失败
+      # ★ 架构硬校验 + targz rootfs 生成（v4 关键修复）
       # ============================================================
-      - name: 校验产物存在（架构硬校验）
+      - name: 生成 targz rootfs 并校验产物
         run: |
           cd openwrt
-          echo "===== bin/ 目录树 ====="
-          ls -la bin/ 2>/dev/null || true
-          find bin/targets -maxdepth 3 -type d 2>/dev/null || true
-          echo ""
-          echo "===== 搜索 rootfs / 镜像 ====="
-          find bin \( -name '*rootfs*' -o -name '*.img' \) 2>/dev/null | head -20 || true
+          # ------------------------------------------------------------
+          # v3 失败原因：bin/targets/armsr/armv8/ 下【一个文件都没有】。
+          #   原因有二：
+          #     (1) haiibo config 把所有 rootfs 格式禁用（已在上一步开启）
+          #     (2) armsr/image/Makefile 只定义了 Build/combined（EFI 镜像），
+          #         没有 rootfs-targz 目标，所以默认 make 不会产出 rootfs.tar.gz。
+          #   而 flippy 打包必须要这个文件（脚本里写死 PACKAGE_FILE=
+          #   "openwrt-armsr-armv8-generic-rootfs.tar.gz"，仅拷贝不生成）。
+          # 解法：显式调用 Build/rootfs-targz 目标。
+          # ------------------------------------------------------------
 
+          echo "===== 当前 bin/targets 状态 ====="
+          find bin/targets -maxdepth 3 2>/dev/null | head -20 || true
+
+          # 开启 CONFIG_TARGET_ROOTFS_TARGZ 后，make 的 kernel_prepare 阶段
+          # 会自动执行 `$(call Image/Build/targz)`，正常情况下产物已存在。
+          # 兜底：若仍无，再显式调一次。
+          if ! ls bin/targets/armsr/armv8/*rootfs*.tar.gz >/dev/null 2>&1; then
+            echo "::notice::未找到 targz rootfs，尝试显式make image"
+            make image V=s 2>&1 | tee /tmp/image.log || {
+              echo "::warning::make image 返回非零，继续用现有产物查找"
+            }
+          else
+            echo "::notice::已找到 targz rootfs，跳过 make image"
+            touch /tmp/image.log
+          fi
+
+          echo "===== 生成后的产物 ====="
+          ls -lh bin/targets/armsr/armv8/ 2>/dev/null || true
+          find bin -name '*rootfs*' 2>/dev/null | head -10 || true
+
+          # ---- 架构硬校验 ----
           if [ -d bin/targets/x86 ]; then
-            echo "::error::检测到 bin/targets/x86 —— 编成了 x86 而非 ARM，target 配置在 defconfig 时丢失"
+            echo "::error::检测到 bin/targets/x86 —— 编成了 x86 而非 ARM"
             exit 1
           fi
 
+          # ---- 定位 rootfs（兼容多种命名）----
           f=""
-          for cand in bin/targets/armsr/armv8/*rootfs.tar.gz; do
-            [ -f "$cand" ] && f="$cand" && break
+          for cand in \
+            bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz \
+            bin/targets/armsr/armv8/*rootfs*.tar.gz \
+            bin/targets/armsr/armv8/*rootfs*.img \
+            bin/targets/armsr/armv8/*combined*.img.gz ; do
+            if [ -f "$cand" ]; then f="$cand"; break; fi
           done
           if [ -z "$f" ]; then
             f=$(find bin -name '*rootfs*.tar.gz' -size +1M 2>/dev/null | head -n1)
           fi
           if [ -z "$f" ]; then
-            echo "::error::未找到 rootfs，请看上方目录树"
+            f=$(find bin -name '*.img*' -size +10M 2>/dev/null | head -n1)
+          fi
+
+          if [ -z "$f" ]; then
+            echo "::error::仍未找到任何 rootfs / 镜像产物。"
+            echo "::error:: bin/targets/armsr/armv8/ 实际内容："
+            ls -laR bin/targets/armsr/ 2>/dev/null | head -40 || true
+            echo "::error:: 可用 Build 目标："
+            grep -oE "^define Build/[a-z-]+" target/linux/armsr/image/Makefile include/image.mk 2>/dev/null
             exit 1
           fi
-          echo "FOUND_ROOTFS=$f"
+
+          # 统一改名成 flippy 期望的名字
+          if [ "$f" != "bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz" ]; then
+            echo "== 重命名以匹配 flippy 期望 =="
+            mkdir -p /tmp/rootfs
+            cp -v "$f" /tmp/rootfs/openwrt-armsr-armv8-generic-rootfs.tar.gz
+            f=/tmp/rootfs/openwrt-armsr-armv8-generic-rootfs.tar.gz
+          else
+            mkdir -p /tmp/rootfs
+            cp -v "$f" /tmp/rootfs/
+          fi
+
+          sz=$(du -b "$f" | awk '{print $1}')
+          echo "FOUND_ROOTFS=$f  size=$sz"
+          [ "$sz" -ge 10485760 ] || { echo "::error::产物过小（<10MB），疑似损坏"; exit 1; }
           echo "$f" > /tmp/rootfs_path.txt
 
       - name: 取出 rootfs
         run: |
           set -e
-          cd openwrt
           mkdir -p /tmp/rootfs
           f=$(cat /tmp/rootfs_path.txt)
-          test -n "$f" && test -f "$f" || { echo "::error::rootfs 路径失效"; exit 1; }
-          cp -v "$f" /tmp/rootfs/openwrt-armvirt-64-generic-rootfs.tar.gz
+          test -n "$f" && test -f "$f" || { echo "::error::rootfs 路径失效: $f"; exit 1; }
+          cp -v "$f" /tmp/rootfs/openwrt-armsr-armv8-generic-rootfs.tar.gz
           ls -lh /tmp/rootfs/
 
       - name: 上传编译日志
@@ -310,14 +421,16 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: build-log
-          path: /tmp/build.log
+          path: |
+            /tmp/build.log
+            /tmp/image.log
           retention-days: 14
 
       - name: 上传 rootfs
         uses: actions/upload-artifact@v5
         with:
           name: openwrt-rootfs
-          path: /tmp/rootfs/openwrt-armvirt-64-generic-rootfs.tar.gz
+          path: /tmp/rootfs/openwrt-armsr-armv8-generic-rootfs.tar.gz
           compression-level: 0
           retention-days: 3
 
@@ -345,7 +458,8 @@ jobs:
         uses: ophub/flippy-openwrt-actions@main
         env:
           PACKAGE_SOC: s905x3_s905d
-          OPENWRT_ARMSR: rootfs/openwrt-armvirt-64-generic-rootfs.tar.gz
+          # v4：文件名与 flippy 脚本内 PACKAGE_FILE 保持一致
+          OPENWRT_ARMSR: rootfs/openwrt-armsr-armv8-generic-rootfs.tar.gz
           KERNEL_REPO_URL: ophub/kernel
           KERNEL_VERSION_NAME: ${{ inputs.kernel_version }}
           KERNEL_AUTO_LATEST: 'true'
