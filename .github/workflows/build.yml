@@ -1,5 +1,5 @@
 # =============================================================================
-#  X96Max+ / N1 OpenWrt 在线编译（v4·修正 rootfs 产出）
+#  X96Max+ / N1 OpenWrt 在线编译（v5·修正产物路径）
 #
 #  ★ 本版核心修复：armvirt → armsr/armv8
 #  ------------------------------------------------------------------
@@ -19,7 +19,7 @@
 #  另：校验阶段会检测 bin/targets/x86 目录，一旦出现立即判失败，
 #      避免“编译成功但架构错误”再次发生。
 # =============================================================================
-name: Build OpenWrt for N1 & X96Max+ (v4)
+name: Build OpenWrt for N1 & X96Max+ (v5)
 
 on:
   workflow_dispatch:
@@ -391,30 +391,33 @@ jobs:
             exit 1
           fi
 
-          # 统一改名成 flippy 期望的名字
-          if [ "$f" != "bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz" ]; then
-            echo "== 重命名以匹配 flippy 期望 =="
-            mkdir -p /tmp/rootfs
-            cp -v "$f" /tmp/rootfs/openwrt-armsr-armv8-generic-rootfs.tar.gz
-            f=/tmp/rootfs/openwrt-armsr-armv8-generic-rootfs.tar.gz
-          else
-            mkdir -p /tmp/rootfs
-            cp -v "$f" /tmp/rootfs/
-          fi
+          # v4 失败点修正：统一把产物落到固定绝对路径 /tmp/rootfs/，
+          # 并把【绝对路径】写入 rootfs_path.txt。
+          # 上一版写的是 bin/targets/... 这样的相对路径，而下一 step不再 cd openwrt，
+          # 导致 `test -f` 判定"路径失效"（rootfs 其实已 copy 到 /tmp/rootfs/ 了）。
+          mkdir -p /tmp/rootfs
+          FINAL=/tmp/rootfs/openwrt-armsr-armv8-generic-rootfs.tar.gz
+          echo "== 复制到固定位置 =="
+          cp -vf "$f" "$FINAL"
+          rm -f /tmp/rootfs/*.img /tmp/rootfs/*.img.gz 2>/dev/null || true
 
-          sz=$(du -b "$f" | awk '{print $1}')
-          echo "FOUND_ROOTFS=$f  size=$sz"
+          sz=$(du -b "$FINAL" | awk '{print $1}')
+          echo "FOUND_ROOTFS=$FINAL  size=$sz"
           [ "$sz" -ge 10485760 ] || { echo "::error::产物过小（<10MB），疑似损坏"; exit 1; }
-          echo "$f" > /tmp/rootfs_path.txt
+          echo "== /tmp/rootfs 内容 =="
+          ls -lh /tmp/rootfs/
+          echo "$FINAL" > /tmp/rootfs_path.txt
 
-      - name: 取出 rootfs
+      - name: 取出 rootfs（校验）
         run: |
           set -e
-          mkdir -p /tmp/rootfs
           f=$(cat /tmp/rootfs_path.txt)
-          test -n "$f" && test -f "$f" || { echo "::error::rootfs 路径失效: $f"; exit 1; }
-          cp -v "$f" /tmp/rootfs/openwrt-armsr-armv8-generic-rootfs.tar.gz
-          ls -lh /tmp/rootfs/
+          echo "rootfs 路径: $f"
+          test -f "$f" || { echo "::error::rootfs 不存在: $f"; exit 1; }
+          ls -lh "$f"
+          # 校验是合法的 gzip tar
+          tar tzf "$f" >/dev/null 2>&1 || { echo "::error::rootfs 不是有效的 tar.gz"; exit 1; }
+          echo "rootfs 校验通过"
 
       - name: 上传编译日志
         if: always()
