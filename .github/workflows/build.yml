@@ -1,30 +1,31 @@
 # =============================================================================
-#  X96Max+ / N1 OpenWrt 在线编译（修正版）
-#  流程:  LEDE 编 armvirt/64 rootfs  →  F 大脚本(unifreq/openwrt_packit) 打包
-#  插件集: 对齐 haiibo ARMv8_PLUS (configs/armv8-plus.config + diy-script.sh)
+#  X96Max+ / N1 OpenWrt 在线编译（v3·修正架构）
 #
-#  本版修复（相对原版）:
-#    1. [核心] 产物探测不再硬编码 bin/targets/armvirt/64/
-#       → 原编译其实成功，但 armvirt 产物目录层级随 LEDE master 变动，
-#         写死路径导致「编译成功却被判失败」。改为全盘 find + 打印目录树。
-#    2. 锁定 LEDE commit，消灭 master 漂移导致的随机失败。
-#    3. 编译失败不再被 `|| make -j1` 掩盖，输出真实错误摘要。
-#    4. 始终上传 build.log，以后失败可直接看日志（省去猜）。
-#    5. 消除 kmod-oaf 递归依赖告警（destan19/OpenAppFilter 上游 Kconfig 问题）。
+#  ★ 本版核心修复：armvirt → armsr/armv8
+#  ------------------------------------------------------------------
+#  【v2 失败的真正原因】
+#    LEDE 仓库在 2025-04-28 提交 dc780ad837 "armsr: add new target from armvirt"
+#    把 target/linux/armvirt 更名/重构为 target/linux/armsr（细分 armv7 / armv8）。
+#    所以在当前 master(ff7be3fa21) 里 target/linux/armvirt 目录已不存在。
+#    v2 沿用 haiibo 那份只写了 CONFIG_TARGET_armvirt* 的旧 config，
+#    make defconfig 找不到对应 target -> 回落到默认的 x86/64
+#    -> 编译“成功”但产物是 bin/targets/x86/64（纯 x86，根本不是 ARM 固件）。
 #
-#  内核说明:
-#    - 走 ophub/kernel 的 kernel_flippy，支持 5.15 / 6.1 / 6.12 / 6.18
-#    - 脚本要求 KERNEL_AUTO_LATEST=true，此时输入写“系列号”(如 6.1.y)，
-#      会自动解析成该系列最新小版本
-#    - 默认只编 6.1.y  ->  解析为 6.1.163  ->  产物名 ..._k6.1.163.img.gz
+#  【正确做法】
+#    target = armsr，subtarget = armv8，device = generic
+#    产物路径 = bin/targets/armsr/armv8/*rootfs.tar.gz
+#    对应关系：armvirt/64  ==  armsr/armv8   （同一套东西，改了名）
+#
+#  另：校验阶段会检测 bin/targets/x86 目录，一旦出现立即判失败，
+#      避免“编译成功但架构错误”再次发生。
 # =============================================================================
-name: Build OpenWrt for N1 & X96Max+ (fixed)
+name: Build OpenWrt for N1 & X96Max+ (v3)
 
 on:
   workflow_dispatch:
     inputs:
       kernel_version:
-        description: "内核（系列号；6.1.y=默认。可多写如 6.1.y_6.12.y，下划线连接）"
+        description: "内核（系列号；6.1.y=默认。可多写如 6.1.y_6.12.y）"
         required: true
         default: "6.1.y"
       openwrt_ver:
@@ -32,7 +33,7 @@ on:
         required: true
         default: "R24.1.13"
       lede_commit:
-        description: "锁定 LEDE 提交（留空=用下方 LEDE_FALLBACK_COMMIT）"
+        description: "锁定 LEDE 提交（留空=用 LEDE_FALLBACK_COMMIT）"
         required: false
         default: ""
 
@@ -47,15 +48,12 @@ env:
   TZ: Asia/Shanghai
   REPO_URL: https://github.com/coolsnowwolf/lede
   REPO_BRANCH: master
-  # 兜底 commit：显式锁定，杜绝「昨天能编今天不能」。
-  # 验证此版跑通后，可换成你自己验证过的 commit。
-  LEDE_FALLBACK_COMMIT: ff7be3fa21
+  LEDE_FALLBACK_COMMIT: ff7be3fa21cae4277a0b2e8d6653b8acce8ac236
   HAI_RAW: https://raw.githubusercontent.com/haiibo/OpenWrt/main
 
 jobs:
-  # ============================================================ 第 1 步
   build-rootfs:
-    name: 1. 编译 armvirt/64 rootfs
+    name: 1. 编译 armsr/armv8 rootfs
     runs-on: ubuntu-22.04
     steps:
       - name: 检查磁盘与内存
@@ -84,12 +82,34 @@ jobs:
             git clone --filter=blob:none $REPO_URL -b $REPO_BRANCH openwrt
             cd openwrt && git checkout ${{ inputs.lede_commit }}
           else
-            # [修复2] 显式锁定 commit，不再裸拉 master
             git clone $REPO_URL -b $REPO_BRANCH openwrt
             cd openwrt && git checkout $LEDE_FALLBACK_COMMIT
           fi
-          echo "== 实际LEDE commit =="
+          echo "== 实际 LEDE commit =="
           git rev-parse HEAD
+
+      # ============================================================
+      # ★ 关键前置检查：确认 armvirt 已更名，armsr 确实存在
+      # ============================================================
+      - name: 确认 ARM target 可用（armvirt → armsr）
+        run: |
+          cd openwrt
+          echo "== 检测 target/linux 下的 ARM 通用 target =="
+          if [ -d target/linux/armvirt ]; then
+            echo "::notice::本 commit 仍保留 armvirt（未更名）"
+          else
+            echo "::notice::armvirt 已不存在（预期内，见 v3 注释）"
+          fi
+          ls -d target/linux/armsr 2>/dev/null || {
+            echo "::error::连 armsr 也没有，此 commit 结构异常，请更换 lede_commit"
+            exit 1
+          }
+          echo "== armsr 子目录 =="
+          ls -1 target/linux/armsr/
+          echo "== BOARD 定义 =="
+          grep -E '^(BOARD|BOARDNAME|KERNEL_PATCHVER)' target/linux/armsr/Makefile || true
+          echo "== 可用特性（应含 cpiogz/targz → rootfs.tar.gz 由此产生）=="
+          grep -E '^FEATURES' target/linux/armsr/Makefile || true
 
       - name: 套用 haiibo ARMv8_PLUS 配置与脚本
         run: |
@@ -103,8 +123,8 @@ jobs:
             wget -O scripts/$f ${HAI_RAW}/scripts/$f
           done
           chmod +x diy-script.sh scripts/*.sh
-          echo "== 确认 target 为 armvirt/64 =="
-          grep -E '^CONFIG_TARGET_(armvirt|armvirt_64)' .config
+          echo "== haiibo config 里的 target 行 =="
+          grep -E '^CONFIG_TARGET' .config || true
 
       - name: 应用插件集
         run: |
@@ -112,39 +132,76 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # diy-script.sh 及其调用的两个辅助脚本硬编码了 $GITHUB_WORKSPACE，
-          # 而本 workflow 没有 checkout 步骤，该变量为空 -> cp 全部失败。
           export GITHUB_WORKSPACE="$PWD"
-
           wget -O scripts/.zshrc ${HAI_RAW}/scripts/.zshrc || true
           [ -f scripts/011-fix-mbo-modules-build.patch ] || \
             wget -O scripts/011-fix-mbo-modules-build.patch ${HAI_RAW}/scripts/011-fix-mbo-modules-build.patch
 
-          # PassWall / PassWall2 已从 xiaorouji/ 迁移到 Openwrt-Passwall/
+          # PassWall 已从 xiaorouji/ 迁移到 Openwrt-Passwall/
           sed -i 's#xiaorouji/openwrt-passwall-packages#Openwrt-Passwall/openwrt-passwall-packages#g;
                   s#xiaorouji/openwrt-passwall2#Openwrt-Passwall/openwrt-passwall2#g;
                   s#xiaorouji/openwrt-passwall\b#Openwrt-Passwall/openwrt-passwall#g' diy-script.sh
-          echo "== 确认 PassWall 地址已替换 =="
           grep -n 'passwall' diy-script.sh
 
-          # 让第三方插件克隆失败不致命
           sed -i 's/^git clone \(.*\)$/git clone \1 || true/; s/^git_sparse_clone \(.*\)$/git_sparse_clone \1 || true/' diy-script.sh
 
           ./diy-script.sh
-          ./scripts/preset-clash-core.sh arm64 || echo "::warning::clash 核心下载失败，不影响其它插件"
-          ./scripts/preset-terminal-tools.sh || echo "::warning::终端工具下载失败，不影响固件功能"
+          ./scripts/preset-clash-core.sh arm64 || echo "::warning::clash 核心下载失败"
+          ./scripts/preset-terminal-tools.sh || echo "::warning::终端工具下载失败"
+
+      # ============================================================
+      # ★ 核心修复：armvirt → armsr/armv8
+      # ============================================================
+      - name: 锁定编译目标为 armsr/armv8（核心修复）
+        run: |
+          cd openwrt
+          sed -i '/^CONFIG_TARGET_armvirt/d' .config
+          for kv in \
+            "CONFIG_TARGET_armsr=y" \
+            "CONFIG_TARGET_armsr_armv8=y" \
+            "CONFIG_TARGET_armsr_armv8_DEVICE_generic=y" \
+            "CONFIG_TARGET_BOARD=armsr" \
+            "CONFIG_TARGET_SUBTARGET=armv8" \
+            "CONFIG_TARGET_ARCH_PACKAGES=\"armsr-armv8\"" \
+            "CONFIG_TARGET_ARCH=aarch64_generic" \
+            "CONFIG_TARGET_MULTILIB=y" \
+            "CONFIG_TARGET_ALL_KERNELARCHS=y" \
+            "CONFIG_TARGET_ARCH_WORDSIZE=64" \
+            ; do
+            k="${kv%%=*}"; v="${kv#*=}"
+            sed -i "/^${k}=/d;/^# ${k} is not set$/d" .config
+            echo "${k}=${v}" >> .config
+          done
+          make defconfig
+
+          echo "===== target 校验 ====="
+          fail=0
+          for k in CONFIG_TARGET_armsr CONFIG_TARGET_armsr_armv8 \
+                   CONFIG_TARGET_armsr_armv8_DEVICE_generic CONFIG_TARGET_BOARD CONFIG_TARGET_SUBTARGET; do
+            if grep -qE "^${k}=" .config; then
+              echo "OK   $(grep -E "^${k}=" .config)"
+            else
+              echo "MISS $k"; fail=1
+            fi
+          done
+          echo "----- ARCH -----"
+          grep -E '^CONFIG_TARGET_(ARCH|ARCH_PACKAGES|ARCH_WORDSIZE)' .config || true
+          echo "----- 确认没有 x86 混入 -----"
+          if grep -qE '^CONFIG_TARGET_(x86|PC|x86_64)' .config; then
+            echo "::error::x86 target 混入！"; fail=1
+          else
+            echo "OK   无 x86"
+          fi
+          [ $fail -eq 0 ] || { echo "::error::target 配置不完整，终止（否则会编出 x86 固件）"; exit 1; }
+          echo "== target 锁定成功 =="
 
       - name: 移除 haiibo 的 ARM 编译参数覆盖
         run: |
           cd openwrt
-          # armv8-plus.config 设了 CONFIG_TARGET_OPTIMIZATION="-Os -pipe -march=armv8-a+crypto ..."
-          # 该值会注入 CFLAGS_FOR_TARGET，使 host 版 libgcc 编译失败：
-          #   configure: error: cannot compute suffix of object files: cannot compile
-          # armvirt 是通用 ARMv8 目标，不需要 per-CPU 调优，删掉即回到OpenWrt 默认值。
+          # armv8-plus.config 的 CONFIG_TARGET_OPTIMIZATION 带 -march=armv8-a+crypto，
+          # 会污染 host 版 libgcc 编译 -> cannot compute suffix of object files
           sed -i '/^CONFIG_TARGET_OPTIMIZATION=/d' .config
-          # adb 从 android.googlesource.com 拉 git 源，本目标用不到，且拖垮 make download
           sed -i 's#^CONFIG_PACKAGE_adb=y#\# CONFIG_PACKAGE_adb is not set#' .config
-          echo "== 确认已移除 =="
           grep -E '^CONFIG_TARGET_OPTIMIZATION|^#? CONFIG_PACKAGE_adb( |$)' .config || true
 
       - name: 启用 perl 模块
@@ -160,9 +217,7 @@ jobs:
       - name: 补齐 F 大打包必选包
         run: |
           cd openwrt
-          has_symbol() {
-            grep -qE "^CONFIG_PACKAGE_${1}=|^# CONFIG_PACKAGE_${1} is not set" .config
-          }
+          has_symbol() { grep -qE "^CONFIG_PACKAGE_${1}=|^# CONFIG_PACKAGE_${1} is not set" .config; }
           force_pkg() {
             if has_symbol "$1"; then
               sed -i "/^# CONFIG_PACKAGE_${1} is not set$/d" .config
@@ -179,9 +234,7 @@ jobs:
                    kmod-cfg80211 kmod-mac80211 hostapd-common iw wpad; do
             force_pkg "$p"
           done
-          # [修复5] 消除 kmod-oaf 递归依赖告警
-          # destan19/OpenAppFilter 的 Kconfig 里 kmod-oaf 自我 select，
-          # make defconfig 会报 "recursive dependency detected"（非致命，但会跳过该符号）
+          # 消除 kmod-oaf 递归依赖告警（destan19/OpenAppFilter 的 Kconfig 自我 select）
           sed -i '/^CONFIG_PACKAGE_kmod-oaf=y/d' .config
           make defconfig
           echo "== 最终自检 =="
@@ -193,14 +246,15 @@ jobs:
                    hostapd-common iw wpad; do
             grep -q "^CONFIG_PACKAGE_${p}=y" .config || { echo "MISS ${p}"; miss=1; }
           done
-          [ $miss -eq 0 ] && echo "必选包自检通过" || echo "::warning::有包缺失，见上方 MISS"
+          [ $miss -eq 0 ] && echo "必选包自检通过" || echo "::warning::有包缺失"
+          echo "===== 再次确认 target 未被 defconfig 丢掉 ====="
+          grep -E '^CONFIG_TARGET_(armsr|BOARD|SUBTARGET|ARCH)=' .config
 
       - name: 编译
         run: |
           cd openwrt
           make -j$(nproc) download || make -j$(nproc) download || true
           echo "== 开始编译 =="
-          # [修复3] 不再用 `|| make -j1` 掩盖错误；失败时打印真实摘要并留下 build.log
           set -o pipefail
           if ! make -j$(nproc) 2>&1 | tee /tmp/build.log; then
             echo "::error::编译失败，错误摘要："
@@ -209,23 +263,33 @@ jobs:
           fi
           echo "== 编译完成 =="
 
-      # [修复1·核心] 产物探测：不再硬编码 bin/targets/armvirt/64/
-      - name: 校验产物存在
+      # ============================================================
+      # ★ 架构硬校验：x86 产物一旦出现立即失败
+      # ============================================================
+      - name: 校验产物存在（架构硬校验）
         run: |
           cd openwrt
-          echo "===== bin/ 目录树（定位真实产物） ====="
+          echo "===== bin/ 目录树 ====="
           ls -la bin/ 2>/dev/null || true
-          echo "----- bin/targets/ 下全部 target -----"
           find bin/targets -maxdepth 3 -type d 2>/dev/null || true
           echo ""
           echo "===== 搜索 rootfs / 镜像 ====="
           find bin \( -name '*rootfs*' -o -name '*.img' \) 2>/dev/null | head -20 || true
 
-          # 原版写死 bin/targets/armvirt/64/*rootfs.tar.gz，
-          # 但该目录层级随 LEDE master 变动 -> 编译成功却被判失败。
-          f=$(find bin -name '*rootfs*.tar.gz' -size +1M 2>/dev/null | head -n1)
+          if [ -d bin/targets/x86 ]; then
+            echo "::error::检测到 bin/targets/x86 —— 编成了 x86 而非 ARM，target 配置在 defconfig 时丢失"
+            exit 1
+          fi
+
+          f=""
+          for cand in bin/targets/armsr/armv8/*rootfs.tar.gz; do
+            [ -f "$cand" ] && f="$cand" && break
+          done
           if [ -z "$f" ]; then
-            echo "::error::未找到 rootfs。请看上方 bin/ 目录树确认真实路径"
+            f=$(find bin -name '*rootfs*.tar.gz' -size +1M 2>/dev/null | head -n1)
+          fi
+          if [ -z "$f" ]; then
+            echo "::error::未找到 rootfs，请看上方目录树"
             exit 1
           fi
           echo "FOUND_ROOTFS=$f"
@@ -241,7 +305,6 @@ jobs:
           cp -v "$f" /tmp/rootfs/openwrt-armvirt-64-generic-rootfs.tar.gz
           ls -lh /tmp/rootfs/
 
-      # [修复4] 无论成败都上传日志，以后失败不用再猜
       - name: 上传编译日志
         if: always()
         uses: actions/upload-artifact@v5
@@ -258,7 +321,6 @@ jobs:
           compression-level: 0
           retention-days: 3
 
-  # ============================================================ 第 2 步
   package:
     name: 2. F 大脚本打包 N1 + X96Max+
     needs: [build-rootfs]
@@ -307,18 +369,18 @@ jobs:
       - name: 发布到 Release
         uses: ncipollo/release-action@v1
         with:
-          tag: OpenWrt-Flippy-Fixed
-          name: "OpenWrt (fixed) for N1 & X96Max+"
+          tag: OpenWrt-Flippy-v3
+          name: "OpenWrt v3 (armsr/armv8) for N1 & X96Max+"
           allowUpdates: true
           removeArtifacts: true
           artifactErrorsFailBuild: false
           artifacts: firmware/*
           token: ${{ secrets.GITHUB_TOKEN }}
           body: |
-            ### 本次编译（修正版）
-            - 第 1 步: LEDE (commit 已锁定) → armvirt/64 rootfs
+            ### 本次编译（v3·armsr/armv8 修正版）
+            - target: **armsr / armv8**（原 armvirt/64 已于 2025-04-28 更名）
+            - LEDE commit: 已锁定，可复现
             - 插件集: haiibo ARMv8_PLUS
-            - 第 2 步: unifreq/openwrt_packit 打包
             - 内核: ${{ inputs.kernel_version }}
             - 目标: s905x3 (X96Max+ 等) 、 s905d (Phicomm N1)
             - 默认地址/密码: 192.168.1.1 / password
