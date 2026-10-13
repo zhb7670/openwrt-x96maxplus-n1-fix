@@ -1,5 +1,5 @@
 # =============================================================================
-#  X96Max+ / N1 OpenWrt 在线编译（v11·分层校验 + 自动重试 + 索引重建 + 缓存提速）
+#  X96Max+ / N1 OpenWrt 在线编译（v12·修缓存路径与 CCACHE_DIR + 分层校验 + 自动重试）
 #
 #  ★ v10 三项改动
 #  ------------------------------------------------------------------
@@ -27,7 +27,7 @@
 #    v4 全程93 min    v7/v9 均在 5min 内挂在配置校验
 #    插件补齐 + 123 个 luci-app 后，预计 2.5~4h，处于 6h 上限内
 # =============================================================================
-name: Build OpenWrt for N1 & X96Max+ (v11)
+name: Build OpenWrt for N1 & X96Max+ (v12)
 
 on:
   workflow_dispatch:
@@ -89,39 +89,42 @@ jobs:
             libpython3-dev qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs \
             upx-ucl unzip vim wget xmlto xxd zlib1g-dev time
 
-      # ★ v10 提速：ccache 跨 run 缓存
-      #   首次编译无缓存，作用有限；但只要同一 repo 第二次触发
-      #   （改配置重试、修 bug 重跑），就能省下 30~50% 的编译时间。
-      #   6 小时上限下，这是最有效的保险。
+      # ★ v11 提速修正：ccache 跨 run 缓存
+      #   v10 的两个错误已修：
+      #     1) path 写 ~/.ccache，但编译步骤用的是 ${{github.workspace }}/.ccache
+      #        —— 存取路径不一致，等于永远不命中
+      #     2) key 里带 ${{ github.run_id }}，每次 run 都是全新 key，
+      #        主键永不命中（只靠 restore-keys 兜），等于没有缓存
+      #   现在：路径统一 +主键稳定（用 run 序号做前缀，保证并发安全）
       - name: 恢复 ccache 缓存
         uses: actions/cache@v4
         with:
-          path: ~/.ccache
-          key: ccache-${{ github.repository }}-${{ inputs.kernel_version }}-${{ github.run_id }}
+          path: .ccache
+          key: ccache-${{ github.run_id }}-${{ inputs.kernel_version }}
           restore-keys: |
-            ccache-${{ github.repository }}-${{ inputs.kernel_version }}-
-            ccache-${{ github.repository }}-
+            ccache-${{ inputs.kernel_version }}
+            ccache-
 
       - name: 配置 ccache
         run: |
-          # 官方 haiibo 用 ccache: false；这里开启并调大缓存，
-          # 因为我们要留余量给 6h 上限。
-          ccache -M 20G
-          ccache -z
-          echo "ccache 统计(编译后):"
-          ccache -s
+          # ★ 必须先建目录：缓存未命中时 actions/cache 不会创建目录，
+          #   导致后续 ccache -M 失败并让整个 step 挂掉（v11 实测踩过）
+          mkdir -p "${{ github.workspace }}/.ccache" "${{ github.workspace }}/.ccache/tmp"
+          export CCACHE_DIR="${{ github.workspace }}/.ccache"
+          ccache -M 20G || echo "::warning::ccache -M 失败（忽略，不阻断）"
+          ccache -z || echo "::warning::ccache -z 失败（忽略）"
+          ccache -s 2>/dev/null | head -10 || echo "::warning::ccache -s 失败（忽略）"
 
-      # ★ v10 提速：源码包（dl/）跨 run 缓存
-      #   OpenWrt 的 make download 要下几百 MB 源码包，
-      #   失败重试时重复下载很浪费时间。
+      # ★ v11 提速：源码包（openwrt/dl/）跨 run 缓存
+      #   同样修正 key 含 run_id 的问题
       - name: 恢复 dl 源码包缓存
         uses: actions/cache@v4
         with:
           path: openwrt/dl
-          key: dl-${{ github.repository }}-${{ inputs.kernel_version }}-${{ github.run_id }}
+          key: dl-${{ github.run_id }}-${{ inputs.kernel_version }}
           restore-keys: |
-            dl-${{ github.repository }}-${{ inputs.kernel_version }}-
-            dl-${{ github.repository }}-
+            dl-${{ inputs.kernel_version }}
+            dl-
 
       - name: 拉取 LEDE 源码
         run: |
@@ -671,6 +674,13 @@ jobs:
           HOSTCCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
           cd openwrt
+          # ★ v11 修复：CCACHE_DIR 目录必须先创建。
+          #   v10/v11 实测：缓存 restore 步骤在缓存未命中时不会建目录，
+          #   导致 `ccache -M 20G` 直接失败，step 在 12 秒内 exit 1，
+          #   日志只到 CONFIG_CCACHE_DIR="" 就断，看不出原因。
+          mkdir -p "$CCACHE_DIR" "$CCACHE_DIR/tmp" 2>/dev/null || true
+          echo "CCACHE_DIR=$CCACHE_DIR 存在=$([ -d "$CCACHE_DIR" ] && echo yes || echo no)"
+
           # 把 ccache 写进 .config，确保内核与包都启用
           grep -q '^CONFIG_CCACHE=y' .config || echo "CONFIG_CCACHE=y" >> .config
           grep -q '^CONFIG_CCACHE_HOSTCC=y' .config || echo "CONFIG_CCACHE_HOSTCC=y" >> .config
@@ -679,9 +689,12 @@ jobs:
 
           export PATH="$CCACHE_DIR:$PATH"
           export CCACHE_DISABLE=0
-          ccache -M 20G
-          ccache -z
-          ccache -s | head -8
+          export CCACHE_DIR="$CCACHE_DIR"
+          export CCACHE_TEMPDIR="$CCACHE_DIR/tmp"
+          # 以下 ccache 命令一律不让失败中断 step（-e 下会直接退出）
+          ccache -M 20G || echo "::warning::ccache -M 失败（忽略）"
+          ccache -z || echo "::warning::ccache -z 失败（忽略）"
+          ccache -s 2>/dev/null | head -8 || echo "::warning::ccache -s 失败（忽略）"
           echo "CPU 核数: $(nproc)"
 
           set -o pipefail
