@@ -12,7 +12,7 @@ name: Auto-retry build
 
 on:
   workflow_run:
-    workflows: ["Build OpenWrt for N1 & X96Max+ (v12)"]
+    workflows: ["Build OpenWrt for N1 & X96Max+ (v13)"]
     types: [completed]
 
 permissions:
