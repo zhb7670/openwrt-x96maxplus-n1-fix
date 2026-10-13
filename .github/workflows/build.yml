@@ -1,5 +1,5 @@
 # =============================================================================
-#  X96Max+ / N1 OpenWrt 在线编译（v7·精准拍平）
+#  X96Max+ / N1 OpenWrt 在线编译（v8·修set -e 陷阱）
 #
 #  ★ 本版核心修复：armvirt → armsr/armv8
 #  ------------------------------------------------------------------
@@ -19,7 +19,7 @@
 #  另：校验阶段会检测 bin/targets/x86 目录，一旦出现立即判失败，
 #      避免“编译成功但架构错误”再次发生。
 # =============================================================================
-name: Build OpenWrt for N1 & X96Max+ (v7)
+name: Build OpenWrt for N1 & X96Max+ (v8)
 
 on:
   workflow_dispatch:
@@ -237,22 +237,32 @@ jobs:
           echo "===== 拍平后 package/ 可用包 ====="
           ls -d package/*/ 2>/dev/null | while read d; do
             n=$(basename "$d")
-            [ -f "package/$n/Makefile" ] && echo "  $n"
+            # ★ 不用 `[ ] && echo`：条件为假时退出码 1，
+            #   在 /usr/bin/bash -e 下会直接终止整个 step。
+            if [ -f "package/$n/Makefile" ]; then echo "  $n"; fi
           done
 
           echo "===== defconfig（让拍平后的包参与依赖解析）====="
           make defconfig
 
           echo "===== 完整性校验 ====="
-          n=$(grep -cE "^CONFIG_PACKAGE_luci-app-[a-zA-Z0-9_-]+=y" .config || true)
-          nu=$(grep -cE "^CONFIG_PACKAGE_luci-i18n-[a-zA-Z0-9_-]+=y" .config || true)
+          # ★ 注意：grep -c 无匹配时返回退出码 1，在 `set -e`(/usr/bin/bash -e)
+          #   下会让整个 step 立刻挂掉（v7 就是这样失败的）。
+          #   必须用 `|| true` 兜住退出码，或用 `|| echo 0`。
+          n=$(grep -cE "^CONFIG_PACKAGE_luci-app-[a-zA-Z0-9_-]+=y" .config 2>/dev/null || true)
+          nu=$(grep -cE "^CONFIG_PACKAGE_luci-i18n-[a-zA-Z0-9_-]+=y" .config 2>/dev/null || true)
+          n=${n:-0}; nu=${nu:-0}
           echo "  config 内 luci-app: $n"
           echo "  config 内 luci-i18n: $nu"
           echo "  官方 haiibo rootfs 实测: luci-app 83 / i18n 40（装成 1317 个包）"
           echo "  ----- 关键 luci-app 是否在 config 中 -----"
           for k in luci-app-passwall luci-app-passwall2 luci-app-openclash \
                    luci-app-mosdns luci-app-smartdns luci-app-alist luci-app-ssr-plus; do
-            grep -qE "^CONFIG_PACKAGE_${k}=y" .config && echo "    ✓ $k" || echo "    ✗ $k缺失"
+            if grep -qE "^CONFIG_PACKAGE_${k}=y" .config 2>/dev/null; then
+              echo "    ✓ $k"
+            else
+              echo "    ✗ $k 缺失"
+            fi
           done
           if [ "$n" -lt 30 ]; then
             echo "::error::luci-app 数量异常偏少（$n < 30），大量插件未被识别"
@@ -442,7 +452,8 @@ jobs:
           #★ 硬校验：确认第三方插件真的被编译了。
           #   v4 的教训：make 全程 success，但 60+ 插件一个没编，rootfs 只有 148MB。
           echo "===== 校验第三方插件是否真的被编译 ====="
-          ifgrep=$(grep -cE "\-C package/luci-app-passwall|\-C package/luci-app-openclash" /tmp/build.log || true)
+          ifgrep=$(grep -cE "\-C package/luci-app-passwall|\-C package/luci-app-openclash" /tmp/build.log 2>/dev/null || true)
+          ifgrep=${ifgrep:-0}
           pkgipk=$(find bin -name 'luci-app-*.ipk' 2>/dev/null | wc -l)
           echo "  build.log 中 package/luci-app-* 编译记录: $ifgrep"
           echo "  产出的 luci-app-*.ipk 数: $pkgipk"
