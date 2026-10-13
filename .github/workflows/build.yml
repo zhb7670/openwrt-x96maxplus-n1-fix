@@ -1,0 +1,325 @@
+# =============================================================================
+#  X96Max+ / N1 OpenWrt 在线编译（修正版）
+#  流程:  LEDE 编 armvirt/64 rootfs  →  F 大脚本(unifreq/openwrt_packit) 打包
+#  插件集: 对齐 haiibo ARMv8_PLUS (configs/armv8-plus.config + diy-script.sh)
+#
+#  本版修复（相对原版）:
+#    1. [核心] 产物探测不再硬编码 bin/targets/armvirt/64/
+#       → 原编译其实成功，但 armvirt 产物目录层级随 LEDE master 变动，
+#         写死路径导致「编译成功却被判失败」。改为全盘 find + 打印目录树。
+#    2. 锁定 LEDE commit，消灭 master 漂移导致的随机失败。
+#    3. 编译失败不再被 `|| make -j1` 掩盖，输出真实错误摘要。
+#    4. 始终上传 build.log，以后失败可直接看日志（省去猜）。
+#    5. 消除 kmod-oaf 递归依赖告警（destan19/OpenAppFilter 上游 Kconfig 问题）。
+#
+#  内核说明:
+#    - 走 ophub/kernel 的 kernel_flippy，支持 5.15 / 6.1 / 6.12 / 6.18
+#    - 脚本要求 KERNEL_AUTO_LATEST=true，此时输入写“系列号”(如 6.1.y)，
+#      会自动解析成该系列最新小版本
+#    - 默认只编 6.1.y  ->  解析为 6.1.163  ->  产物名 ..._k6.1.163.img.gz
+# =============================================================================
+name: Build OpenWrt for N1 & X96Max+ (fixed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "内核（系列号；6.1.y=默认。可多写如 6.1.y_6.12.y，下划线连接）"
+        required: true
+        default: "6.1.y"
+      openwrt_ver:
+        description: "固件版本号（决定产物文件名）"
+        required: true
+        default: "R24.1.13"
+      lede_commit:
+        description: "锁定 LEDE 提交（留空=用下方 LEDE_FALLBACK_COMMIT）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-openwrt-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  # 兜底 commit：显式锁定，杜绝「昨天能编今天不能」。
+  # 验证此版跑通后，可换成你自己验证过的 commit。
+  LEDE_FALLBACK_COMMIT: ff7be3fa21
+  HAI_RAW: https://raw.githubusercontent.com/haiibo/OpenWrt/main
+
+jobs:
+  # ============================================================ 第 1 步
+  build-rootfs:
+    name: 1. 编译 armvirt/64 rootfs
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检查磁盘与内存
+        run: |
+          free -h
+          df -h /
+          echo "根分区可用空间（MB）: $(df -m --output=avail / | tail -n1)"
+
+      - name: 安装编译依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk \
+            gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz mkisofs \
+            msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools \
+            libpython3-dev qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip vim wget xmlto xxd zlib1g-dev time
+
+      - name: 拉取 LEDE 源码
+        run: |
+          if [ -n "${{ inputs.lede_commit }}" ]; then
+            git clone --filter=blob:none $REPO_URL -b $REPO_BRANCH openwrt
+            cd openwrt && git checkout ${{ inputs.lede_commit }}
+          else
+            # [修复2] 显式锁定 commit，不再裸拉 master
+            git clone $REPO_URL -b $REPO_BRANCH openwrt
+            cd openwrt && git checkout $LEDE_FALLBACK_COMMIT
+          fi
+          echo "== 实际LEDE commit =="
+          git rev-parse HEAD
+
+      - name: 套用 haiibo ARMv8_PLUS 配置与脚本
+        run: |
+          cd openwrt
+          wget -O .config ${HAI_RAW}/configs/armv8-plus.config
+          mkdir -p images scripts
+          wget -O diy-script.sh   ${HAI_RAW}/diy-script.sh
+          wget -O images/bg1.jpg  ${HAI_RAW}/images/bg1.jpg
+          for f in init-settings.sh preset-clash-core.sh preset-terminal-tools.sh \
+                   011-fix-mbo-modules-build.patch; do
+            wget -O scripts/$f ${HAI_RAW}/scripts/$f
+          done
+          chmod +x diy-script.sh scripts/*.sh
+          echo "== 确认 target 为 armvirt/64 =="
+          grep -E '^CONFIG_TARGET_(armvirt|armvirt_64)' .config
+
+      - name: 应用插件集
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          # diy-script.sh 及其调用的两个辅助脚本硬编码了 $GITHUB_WORKSPACE，
+          # 而本 workflow 没有 checkout 步骤，该变量为空 -> cp 全部失败。
+          export GITHUB_WORKSPACE="$PWD"
+
+          wget -O scripts/.zshrc ${HAI_RAW}/scripts/.zshrc || true
+          [ -f scripts/011-fix-mbo-modules-build.patch ] || \
+            wget -O scripts/011-fix-mbo-modules-build.patch ${HAI_RAW}/scripts/011-fix-mbo-modules-build.patch
+
+          # PassWall / PassWall2 已从 xiaorouji/ 迁移到 Openwrt-Passwall/
+          sed -i 's#xiaorouji/openwrt-passwall-packages#Openwrt-Passwall/openwrt-passwall-packages#g;
+                  s#xiaorouji/openwrt-passwall2#Openwrt-Passwall/openwrt-passwall2#g;
+                  s#xiaorouji/openwrt-passwall\b#Openwrt-Passwall/openwrt-passwall#g' diy-script.sh
+          echo "== 确认 PassWall 地址已替换 =="
+          grep -n 'passwall' diy-script.sh
+
+          # 让第三方插件克隆失败不致命
+          sed -i 's/^git clone \(.*\)$/git clone \1 || true/; s/^git_sparse_clone \(.*\)$/git_sparse_clone \1 || true/' diy-script.sh
+
+          ./diy-script.sh
+          ./scripts/preset-clash-core.sh arm64 || echo "::warning::clash 核心下载失败，不影响其它插件"
+          ./scripts/preset-terminal-tools.sh || echo "::warning::终端工具下载失败，不影响固件功能"
+
+      - name: 移除 haiibo 的 ARM 编译参数覆盖
+        run: |
+          cd openwrt
+          # armv8-plus.config 设了 CONFIG_TARGET_OPTIMIZATION="-Os -pipe -march=armv8-a+crypto ..."
+          # 该值会注入 CFLAGS_FOR_TARGET，使 host 版 libgcc 编译失败：
+          #   configure: error: cannot compute suffix of object files: cannot compile
+          # armvirt 是通用 ARMv8 目标，不需要 per-CPU 调优，删掉即回到OpenWrt 默认值。
+          sed -i '/^CONFIG_TARGET_OPTIMIZATION=/d' .config
+          # adb 从 android.googlesource.com 拉 git 源，本目标用不到，且拖垮 make download
+          sed -i 's#^CONFIG_PACKAGE_adb=y#\# CONFIG_PACKAGE_adb is not set#' .config
+          echo "== 确认已移除 =="
+          grep -E '^CONFIG_TARGET_OPTIMIZATION|^#? CONFIG_PACKAGE_adb( |$)' .config || true
+
+      - name: 启用 perl 模块
+        run: |
+          cd openwrt
+          for s in CONFIG_PACKAGE_perlbase-file CONFIG_PACKAGE_perlbase-getopt \
+                   CONFIG_PACKAGE_perlbase-time CONFIG_PACKAGE_perlbase-unicode \
+                   CONFIG_PACKAGE_perlbase-utf8; do
+            sed -i "/^# ${s} is not set$/d" .config
+            grep -q "^${s}=" .config || echo "${s}=y" >> .config
+          done
+
+      - name: 补齐 F 大打包必选包
+        run: |
+          cd openwrt
+          has_symbol() {
+            grep -qE "^CONFIG_PACKAGE_${1}=|^# CONFIG_PACKAGE_${1} is not set" .config
+          }
+          force_pkg() {
+            if has_symbol "$1"; then
+              sed -i "/^# CONFIG_PACKAGE_${1} is not set$/d" .config
+              grep -q "^CONFIG_PACKAGE_${1}=" .config || echo "CONFIG_PACKAGE_${1}=y" >> .config
+              echo "OK   $1"
+            else
+              echo "::warning::CONFIG_PACKAGE_$1 不存在，跳过"
+            fi
+          }
+          for p in e2fsprogs mkf2fs perl perlbase-file perlbase-getopt perlbase-time \
+                   perlbase-unicode perlbase-utf8 blkid fdisk lsblk parted attr btrfs-progs \
+                   chattr dosfstools f2fs-tools f2fsck lsattr xfs-fsck xfs-mkfs bsdtar pigz \
+                   bash gawk getopt losetup tar uuidgen acpid kmod-brcmfmac kmod-brcmutil \
+                   kmod-cfg80211 kmod-mac80211 hostapd-common iw wpad; do
+            force_pkg "$p"
+          done
+          # [修复5] 消除 kmod-oaf 递归依赖告警
+          # destan19/OpenAppFilter 的 Kconfig 里 kmod-oaf 自我 select，
+          # make defconfig 会报 "recursive dependency detected"（非致命，但会跳过该符号）
+          sed -i '/^CONFIG_PACKAGE_kmod-oaf=y/d' .config
+          make defconfig
+          echo "== 最终自检 =="
+          miss=0
+          for p in perl perlbase-file perlbase-getopt perlbase-time perlbase-unicode perlbase-utf8 \
+                   blkid fdisk lsblk parted attr btrfs-progs chattr dosfstools e2fsprogs f2fs-tools \
+                   f2fsck lsattr mkf2fs xfs-fsck xfs-mkfs bsdtar pigz bash gawk getopt losetup tar \
+                   uuidgen acpid kmod-brcmfmac kmod-brcmutil kmod-cfg80211 kmod-mac80211 \
+                   hostapd-common iw wpad; do
+            grep -q "^CONFIG_PACKAGE_${p}=y" .config || { echo "MISS ${p}"; miss=1; }
+          done
+          [ $miss -eq 0 ] && echo "必选包自检通过" || echo "::warning::有包缺失，见上方 MISS"
+
+      - name: 编译
+        run: |
+          cd openwrt
+          make -j$(nproc) download || make -j$(nproc) download || true
+          echo "== 开始编译 =="
+          # [修复3] 不再用 `|| make -j1` 掩盖错误；失败时打印真实摘要并留下 build.log
+          set -o pipefail
+          if ! make -j$(nproc) 2>&1 | tee /tmp/build.log; then
+            echo "::error::编译失败，错误摘要："
+            grep -nE '(^|: )(error|Error|ERROR):|No such file|cannot |undefined reference|Build failed' /tmp/build.log | tail -40 || true
+            exit 1
+          fi
+          echo "== 编译完成 =="
+
+      # [修复1·核心] 产物探测：不再硬编码 bin/targets/armvirt/64/
+      - name: 校验产物存在
+        run: |
+          cd openwrt
+          echo "===== bin/ 目录树（定位真实产物） ====="
+          ls -la bin/ 2>/dev/null || true
+          echo "----- bin/targets/ 下全部 target -----"
+          find bin/targets -maxdepth 3 -type d 2>/dev/null || true
+          echo ""
+          echo "===== 搜索 rootfs / 镜像 ====="
+          find bin \( -name '*rootfs*' -o -name '*.img' \) 2>/dev/null | head -20 || true
+
+          # 原版写死 bin/targets/armvirt/64/*rootfs.tar.gz，
+          # 但该目录层级随 LEDE master 变动 -> 编译成功却被判失败。
+          f=$(find bin -name '*rootfs*.tar.gz' -size +1M 2>/dev/null | head -n1)
+          if [ -z "$f" ]; then
+            echo "::error::未找到 rootfs。请看上方 bin/ 目录树确认真实路径"
+            exit 1
+          fi
+          echo "FOUND_ROOTFS=$f"
+          echo "$f" > /tmp/rootfs_path.txt
+
+      - name: 取出 rootfs
+        run: |
+          set -e
+          cd openwrt
+          mkdir -p /tmp/rootfs
+          f=$(cat /tmp/rootfs_path.txt)
+          test -n "$f" && test -f "$f" || { echo "::error::rootfs 路径失效"; exit 1; }
+          cp -v "$f" /tmp/rootfs/openwrt-armvirt-64-generic-rootfs.tar.gz
+          ls -lh /tmp/rootfs/
+
+      # [修复4] 无论成败都上传日志，以后失败不用再猜
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-log
+          path: /tmp/build.log
+          retention-days: 14
+
+      - name: 上传 rootfs
+        uses: actions/upload-artifact@v5
+        with:
+          name: openwrt-rootfs
+          path: /tmp/rootfs/openwrt-armvirt-64-generic-rootfs.tar.gz
+          compression-level: 0
+          retention-days: 3
+
+  # ============================================================ 第 2 步
+  package:
+    name: 2. F 大脚本打包 N1 + X96Max+
+    needs: [build-rootfs]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 下载 rootfs
+        uses: actions/download-artifact@v5
+        with:
+          name: openwrt-rootfs
+          path: rootfs
+
+      - name: 安装打包依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y btrfs-progs dosfstools e2fsprogs util-linux uuid-runtime \
+            fdisk parted gawk tar pigz p7zip-full rsync wget curl
+          ls -lh rootfs/
+
+      - name: 调用 F 大打包脚本
+        uses: ophub/flippy-openwrt-actions@main
+        env:
+          PACKAGE_SOC: s905x3_s905d
+          OPENWRT_ARMSR: rootfs/openwrt-armvirt-64-generic-rootfs.tar.gz
+          KERNEL_REPO_URL: ophub/kernel
+          KERNEL_VERSION_NAME: ${{ inputs.kernel_version }}
+          KERNEL_AUTO_LATEST: 'true'
+          WHOAMI: Haiibo
+          OPENWRT_VER: ${{ inputs.openwrt_ver }}
+          DISTRIB_REVISION: ${{ inputs.openwrt_ver }}
+          OPENWRT_IP: 192.168.1.1
+          GZIP_IMGS: gz
+
+      - name: 收集产物
+        run: |
+          mkdir -p firmware
+          cp -v "${PACKAGED_OUTPUTPATH}"/*.img.gz firmware/ 2>/dev/null || true
+          cp -v "${PACKAGED_OUTPUTPATH}"/*.sha256 firmware/ 2>/dev/null || true
+          if [ -z "$(ls -A firmware)" ]; then
+            echo "::error::没有产出镜像，请翻日志找报错"
+            exit 1
+          fi
+          ls -lh firmware/
+
+      - name: 发布到 Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: OpenWrt-Flippy-Fixed
+          name: "OpenWrt (fixed) for N1 & X96Max+"
+          allowUpdates: true
+          removeArtifacts: true
+          artifactErrorsFailBuild: false
+          artifacts: firmware/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### 本次编译（修正版）
+            - 第 1 步: LEDE (commit 已锁定) → armvirt/64 rootfs
+            - 插件集: haiibo ARMv8_PLUS
+            - 第 2 步: unifreq/openwrt_packit 打包
+            - 内核: ${{ inputs.kernel_version }}
+            - 目标: s905x3 (X96Max+ 等) 、 s905d (Phicomm N1)
+            - 默认地址/密码: 192.168.1.1 / password
+            - 刷机: U 盘启动 → 系统 → 晶晨宝盒 → 安装 OpenWrt
