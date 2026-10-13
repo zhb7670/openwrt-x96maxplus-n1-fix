@@ -1,5 +1,5 @@
 # =============================================================================
-#  X96Max+ / N1 OpenWrt 在线编译（v12·修缓存路径与 CCACHE_DIR + 分层校验 + 自动重试）
+#  X96Max+ / N1 OpenWrt 在线编译（v13·修 ccache 4.x 变量兼容 + 分层校验 + 自动重试）
 #
 #  ★ v10 三项改动
 #  ------------------------------------------------------------------
@@ -27,7 +27,7 @@
 #    v4 全程93 min    v7/v9 均在 5min 内挂在配置校验
 #    插件补齐 + 123 个 luci-app 后，预计 2.5~4h，处于 6h 上限内
 # =============================================================================
-name: Build OpenWrt for N1 & X96Max+ (v12)
+name: Build OpenWrt for N1 & X96Max+ (v13)
 
 on:
   workflow_dispatch:
@@ -666,12 +666,12 @@ jobs:
         env:
           # ★ v10 提速：让 make 实际走ccache。
           #   装了 ccache 包不等于会用，必须把 CCACHE 打开并写进 .config。
-          #   HOSTCC/SUPPORTED_CCACHE 让主机侧工具也走缓存。
           USE_CCACHE: "1"
           CCACHE_DIR: ${{ github.workspace }}/.ccache
-          HOSTCC: "ccache gcc"
-          HOSTCXX: "ccache g++"
-          HOSTCCACHE_DIR: ${{ github.workspace }}/.ccache
+          # ★ v12：不再用 HOSTCC="ccache gcc" 这种前缀写法。
+          #   ccache 4.x 推荐用 symlink 或直接在 .config 里开 CONFIG_CCACHE，
+          #   前缀写法在部分版本下会与 CCACHE_DISABLE 之类变量冲突导致 host 工具编译失败。
+          #   这里只保留 CCACHE_DIR，让 OpenWrt 自己通过 CONFIG_CCACHE 走缓存。
         run: |
           cd openwrt
           # ★ v11 修复：CCACHE_DIR 目录必须先创建。
@@ -683,12 +683,19 @@ jobs:
 
           # 把 ccache 写进 .config，确保内核与包都启用
           grep -q '^CONFIG_CCACHE=y' .config || echo "CONFIG_CCACHE=y" >> .config
-          grep -q '^CONFIG_CCACHE_HOSTCC=y' .config || echo "CONFIG_CCACHE_HOSTCC=y" >> .config
           make defconfig >/dev/null 2>&1 || true
           grep -E '^CONFIG_CCACHE' .config || true
 
           export PATH="$CCACHE_DIR:$PATH"
-          export CCACHE_DISABLE=0
+          # ★ v12 修复：删除 CCACHE_DISABLE=0。
+          #   ccache 4.x 把CCACHE_DISABLE 改成了"专用开关"，
+          #   取值必须是 true/false，传 0 会报：
+          #     ccache: error: CCACHE_DISABLE: invalid boolean value "0"
+          #     (did you mean to set "CCACHE_NODISABLE=true"?)
+          #   该错误会让所有 host 工具编译失败：
+          #     ERROR: tools/m4 failed to build.
+          #     ERROR: tools/cpio failed to build.
+          #   不设这个变量本身就是"不禁用"，直接移除即可。
           export CCACHE_DIR="$CCACHE_DIR"
           export CCACHE_TEMPDIR="$CCACHE_DIR/tmp"
           # 以下 ccache 命令一律不让失败中断 step（-e 下会直接退出）
